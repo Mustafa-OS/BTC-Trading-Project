@@ -1,0 +1,26 @@
+# Private files with API keys — never commit these
+svi_ui.py
+test.py
+bot.py
+realtime.py
+svi.py
+svi_public.py
+
+# Data files
+*.csv
+*.xlsx
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+venv/
+.venv/
+
+# Claude
+.claude/

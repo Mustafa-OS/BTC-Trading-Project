@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SVI Vol Surface — Live</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'SF Mono','Fira Code',Consolas,monospace;background:#0d1117;color:#e6edf3;padding:16px 20px}
+  .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+  .header h1{font-size:20px;color:#58a6ff}
+  .header select{font-family:inherit;font-size:14px;padding:6px 12px;background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;cursor:pointer;outline:none}
+  .status-bar{font-size:11px;color:#8b949e;margin-left:14px}
+  .status-bar .live{color:#3fb950}
+  .tabs{display:flex;gap:0;margin-bottom:16px;border-bottom:1px solid #30363d}
+  .tab{padding:8px 20px;font-size:13px;cursor:pointer;color:#8b949e;border-bottom:2px solid transparent;background:none;border-top:none;border-left:none;border-right:none;font-family:inherit}
+  .tab:hover{color:#e6edf3}.tab.active{color:#58a6ff;border-bottom-color:#58a6ff}
+  .tab-content{display:none}.tab-content.active{display:block}
+  .grid{display:grid;grid-template-columns:1fr 360px;gap:16px}
+  .chart-container{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:8px;min-height:460px}
+  .sidebar{display:flex;flex-direction:column;gap:12px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#8b949e;margin-bottom:10px;border-bottom:1px solid #21262d;padding-bottom:6px}
+  .param-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 14px}
+  .param-row{display:flex;justify-content:space-between;padding:2px 0}
+  .param-label{color:#8b949e;font-size:12px}.param-value{color:#e6edf3;font-size:12px;font-weight:600}
+  .param-value.highlight{color:#58a6ff}.param-value.green{color:#3fb950}.param-value.yellow{color:#d29922}.param-value.red{color:#f85149}
+  .param-value.dim{color:#8b949e;font-weight:normal;font-size:10px}
+  .strike-table{width:100%;border-collapse:collapse;font-size:11px}
+  .strike-table th{text-align:left;color:#8b949e;padding:3px 5px;border-bottom:1px solid #21262d;font-weight:normal}
+  .strike-table td{padding:4px 5px}.strike-table tr.atmf td{color:#58a6ff;font-weight:600}
+  .futures-grid{display:grid;grid-template-columns:1fr 320px;gap:16px}
+  .futures-table{width:100%;border-collapse:collapse;font-size:12px}
+  .futures-table th{text-align:left;color:#8b949e;padding:6px 8px;border-bottom:1px solid #21262d;font-weight:normal;font-size:11px}
+  .futures-table td{padding:6px 8px;border-bottom:1px solid #161b22}
+  .env-toggle{display:flex;gap:8px;align-items:center;margin-right:20px}
+  .env-toggle label{font-size:11px;color:#8b949e;cursor:pointer}
+  .env-toggle input[type=radio]{accent-color:#58a6ff}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div style="display:flex;align-items:center;">
+    <h1>SVI Vol Surface</h1>
+    <span class="status-bar" id="status">
+      <span class="live" id="dot">&#9679;</span>
+      <span id="status-text">Connecting...</span>
+    </span>
+  </div>
+  <div style="display:flex;align-items:center;gap:20px;">
+    <div class="env-toggle">
+      <label><input type="radio" name="env" value="test" checked> Testnet</label>
+      <label><input type="radio" name="env" value="prod"> Production</label>
+    </div>
+    <div>
+      <label style="font-size:12px;color:#8b949e;margin-right:6px;">Expiry:</label>
+      <select id="expiry-select"></select>
+    </div>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="vol-tab">Vol Smile</button>
+  <button class="tab" data-tab="futures-tab">Futures Curve</button>
+</div>
+
+<!-- Vol Smile Tab -->
+<div id="vol-tab" class="tab-content active">
+  <div class="grid">
+    <div class="chart-container"><div id="chart" style="width:100%;height:100%;"></div></div>
+    <div class="sidebar">
+      <div class="card">
+        <h2>Market</h2>
+        <div class="param-row"><span class="param-label">Forward</span><span class="param-value highlight" id="v-forward">&mdash;</span></div>
+        <div class="param-row"><span class="param-label">Source</span><span class="param-value dim" id="v-fwd-source">&mdash;</span></div>
+        <div class="param-row"><span class="param-label">Spot (Index)</span><span class="param-value" id="v-spot">&mdash;</span></div>
+        <div class="param-row"><span class="param-label">Time to Expiry</span><span class="param-value" id="v-T">&mdash;</span></div>
+        <div class="param-row"><span class="param-label">Points Used</span><span class="param-value" id="v-npoints">&mdash;</span></div>
+        <div class="param-row"><span class="param-label">Last Update (UTC)</span><span class="param-value" id="v-ts">&mdash;</span></div>
+      </div>
+      <div class="card">
+        <h2>SVI Parameters</h2>
+        <div class="param-grid">
+          <div class="param-row"><span class="param-label">a</span><span class="param-value" id="v-a">&mdash;</span></div>
+          <div class="param-row"><span class="param-label">b</span><span class="param-value" id="v-b">&mdash;</span></div>
+          <div class="param-row"><span class="param-label">&rho; (rho)</span><span class="param-value" id="v-rho">&mdash;</span></div>
+          <div class="param-row"><span class="param-label">m</span><span class="param-value" id="v-m">&mdash;</span></div>
+          <div class="param-row"><span class="param-label">&sigma; (sigma)</span><span class="param-value" id="v-sigma">&mdash;</span></div>
+          <div class="param-row"><span class="param-label">RMSE</span><span class="param-value" id="v-rmse">&mdash;</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>ATMF Pricing</h2>
+        <table class="strike-table">
+          <thead><tr><th>Strike</th><th>Mkt IV</th><th>SVI IV</th></tr></thead>
+          <tbody id="strike-body"><tr><td colspan="3" style="color:#8b949e">Waiting...</td></tr></tbody>
+        </table>
+        <div style="margin-top:10px;border-top:1px solid #21262d;padding-top:8px;">
+          <div class="param-row"><span class="param-label">ATMF Call</span><span class="param-value green" id="v-call">&mdash;</span></div>
+          <div class="param-row"><span class="param-label">ATMF Put</span><span class="param-value red" id="v-put">&mdash;</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Futures Curve Tab -->
+<div id="futures-tab" class="tab-content">
+  <div class="futures-grid">
+    <div><div class="chart-container"><div id="futures-chart" style="width:100%;height:100%;"></div></div></div>
+    <div class="sidebar">
+      <div class="card">
+        <h2>Spot &amp; Futures</h2>
+        <div class="param-row"><span class="param-label">BTC Spot (Index)</span><span class="param-value highlight" id="vf-spot">&mdash;</span></div>
+        <div style="margin-top:10px;">
+          <table class="futures-table">
+            <thead><tr><th>Contract</th><th>T (yr)</th><th>Mark ($)</th><th>Rate (%)</th></tr></thead>
+            <tbody id="futures-body"><tr><td colspan="4" style="color:#8b949e">Waiting...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card"><h2>Rate Model</h2><div id="rate-chart" style="width:100%;height:200px;"></div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ====================================================================
+//  CONFIG
+// ====================================================================
+const ENVS = {
+  test: { rest: 'https://test.deribit.com/api/v2', ws: 'wss://test.deribit.com/ws/api/v2' },
+  prod: { rest: 'https://www.deribit.com/api/v2',  ws: 'wss://www.deribit.com/ws/api/v2' },
+};
+let ENV = 'test';
+function baseUrl() { return ENVS[ENV].rest; }
+function wsUrl()   { return ENVS[ENV].ws; }
+
+// ====================================================================
+//  MATH UTILITIES
+// ====================================================================
+function normCdf(x) {
+  // Abramowitz & Stegun approximation
+  const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x) / Math.SQRT2;
+  const t = 1.0 / (1.0 + p * x);
+  const y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1) * t * Math.exp(-x*x);
+  return 0.5 * (1.0 + sign * y);
+}
+
+function normPdf(x) { return Math.exp(-0.5*x*x) / Math.sqrt(2*Math.PI); }
+
+function black76Call(F, K, T, sig) {
+  if (T <= 0 || sig <= 0) return Math.max(F - K, 0);
+  const d1 = (Math.log(F/K) + 0.5*sig*sig*T) / (sig*Math.sqrt(T));
+  const d2 = d1 - sig*Math.sqrt(T);
+  return F*normCdf(d1) - K*normCdf(d2);
+}
+
+function black76Put(F, K, T, sig) {
+  if (T <= 0 || sig <= 0) return Math.max(K - F, 0);
+  const d1 = (Math.log(F/K) + 0.5*sig*sig*T) / (sig*Math.sqrt(T));
+  const d2 = d1 - sig*Math.sqrt(T);
+  return K*normCdf(-d2) - F*normCdf(-d1);
+}
+
+// ====================================================================
+//  SVI MODEL
+// ====================================================================
+function sviTotalVar(k, a, b, rho, m, sigma) {
+  return a + b * (rho*(k-m) + Math.sqrt((k-m)*(k-m) + sigma*sigma));
+}
+
+function sviIV(k, T, a, b, rho, m, sigma) {
+  const w = Math.max(sviTotalVar(k, a, b, rho, m, sigma), 1e-8);
+  return Math.sqrt(w / T);
+}
+
+// ====================================================================
+//  NELDER-MEAD OPTIMIZER (bounded via penalty)
+// ====================================================================
+function nelderMead(fn, x0, bounds, maxIter=3000, tol=1e-12) {
+  const n = x0.length;
+  const alpha=1, gamma=2, rho=0.5, sigma_nm=0.5;
+
+  // Penalized objective
+  function penalized(x) {
+    let pen = 0;
+    for (let i = 0; i < n; i++) {
+      if (x[i] < bounds[i][0]) pen += 1e6 * (bounds[i][0]-x[i])**2;
+      if (x[i] > bounds[i][1]) pen += 1e6 * (x[i]-bounds[i][1])**2;
+    }
+    return fn(x) + pen;
+  }
+
+  // Build initial simplex
+  let simplex = [x0.slice()];
+  for (let i = 0; i < n; i++) {
+    const p = x0.slice();
+    p[i] += (bounds[i][1] - bounds[i][0]) * 0.05 + 1e-4;
+    simplex.push(p);
+  }
+  let fvals = simplex.map(p => penalized(p));
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    // Sort
+    const idx = Array.from({length: n+1}, (_,i)=>i).sort((a,b) => fvals[a]-fvals[b]);
+    simplex = idx.map(i => simplex[i]);
+    fvals = idx.map(i => fvals[i]);
+
+    // Check convergence
+    if (Math.abs(fvals[n] - fvals[0]) < tol) break;
+
+    // Centroid (excluding worst)
+    const c = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) c[j] += simplex[i][j];
+    for (let j = 0; j < n; j++) c[j] /= n;
+
+    // Reflection
+    const xr = c.map((v,j) => v + alpha*(v - simplex[n][j]));
+    const fr = penalized(xr);
+    if (fr < fvals[n-1] && fr >= fvals[0]) { simplex[n] = xr; fvals[n] = fr; continue; }
+    if (fr < fvals[0]) {
+      const xe = c.map((v,j) => v + gamma*(xr[j] - v));
+      const fe = penalized(xe);
+      if (fe < fr) { simplex[n] = xe; fvals[n] = fe; } else { simplex[n] = xr; fvals[n] = fr; }
+      continue;
+    }
+    // Contraction
+    const xc = c.map((v,j) => v + rho*(simplex[n][j] - v));
+    const fc = penalized(xc);
+    if (fc < fvals[n]) { simplex[n] = xc; fvals[n] = fc; continue; }
+    // Shrink
+    for (let i = 1; i <= n; i++) {
+      for (let j = 0; j < n; j++) simplex[i][j] = simplex[0][j] + sigma_nm*(simplex[i][j]-simplex[0][j]);
+      fvals[i] = penalized(simplex[i]);
+    }
+  }
+  // Return best
+  let bestIdx = 0;
+  for (let i = 1; i <= n; i++) if (fvals[i] < fvals[bestIdx]) bestIdx = i;
+  return { x: simplex[bestIdx], fun: fvals[bestIdx] };
+}
+
+function calibrateSVI(kArr, ivArr, T) {
+  const wMarket = ivArr.map(iv => iv*iv*T);
+  // Interpolate ATM variance
+  let atmVar = wMarket[0];
+  for (let i = 0; i < kArr.length-1; i++) {
+    if (kArr[i] <= 0 && kArr[i+1] >= 0) {
+      const t = (0 - kArr[i]) / (kArr[i+1] - kArr[i]);
+      atmVar = wMarket[i] + t * (wMarket[i+1] - wMarket[i]);
+      break;
+    }
+  }
+
+  const bounds = [[-1,5],[1e-6,5],[-0.999,0.999],[-1,1],[1e-6,5]];
+  const starts = [
+    [atmVar, 0.05, -0.2, 0, 0.1],
+    [atmVar, 0.1, -0.5, 0, 0.2],
+    [atmVar, 0.2, 0.0, 0, 0.05],
+    [atmVar*0.8, 0.15, -0.3, -0.05, 0.15],
+  ];
+
+  function objective(p) {
+    let sum = 0;
+    for (let i = 0; i < kArr.length; i++) {
+      const w = sviTotalVar(kArr[i], p[0], p[1], p[2], p[3], p[4]);
+      const ivModel = Math.sqrt(Math.max(w, 1e-10) / T);
+      sum += (ivModel - ivArr[i]) ** 2;
+    }
+    return sum;
+  }
+
+  let best = null, bestFun = Infinity;
+  for (const sp of starts) {
+    const res = nelderMead(objective, sp, bounds);
+    if (res.fun < bestFun) { bestFun = res.fun; best = res; }
+  }
+  if (best && bestFun < 1.0) return best.x;
+  return null;
+}
+
+// ====================================================================
+//  SHORT RATE MODEL (linear interpolation)
+// ====================================================================
+class RateModel {
+  constructor() { this.spot = null; this.data = {}; }
+  updateSpot(s) { this.spot = s; }
+  updateFuture(name, T, mark) { this.data[name] = { T, mark }; }
+  calibrate() { /* data is stored, interpolation done on the fly */ }
+  _sorted() { return Object.values(this.data).sort((a,b) => a.T - b.T); }
+  getRate(T) {
+    if (!this.spot || this.spot <= 0) return 0;
+    const items = this._sorted();
+    if (items.length === 0) return 0;
+    const Ts = items.map(i => i.T), rs = items.map(i => Math.log(i.mark/this.spot)/i.T);
+    if (T <= Ts[0]) return rs[0];
+    if (T >= Ts[Ts.length-1]) return rs[rs.length-1];
+    for (let i = 0; i < Ts.length-1; i++) {
+      if (T >= Ts[i] && T <= Ts[i+1]) {
+        const t = (T - Ts[i]) / (Ts[i+1] - Ts[i]);
+        return rs[i] + t * (rs[i+1] - rs[i]);
+      }
+    }
+    return rs[rs.length-1];
+  }
+  getForward(T) {
+    if (!this.spot) return null;
+    return this.spot * Math.exp(this.getRate(T) * T);
+  }
+  getCurveData() {
+    if (!this.spot) return null;
+    const items = this._sorted();
+    if (items.length < 2) return null;
+    const Tmax = items[items.length-1].T * 1.05;
+    const curveT = [], curveF = [], curveR = [];
+    for (let i = 0; i <= 100; i++) {
+      const t = Tmax * i / 100;
+      curveT.push(t);
+      const r = this.getRate(t);
+      curveF.push(this.spot * Math.exp(r * t));
+      curveR.push(r * 100);
+    }
+    return {
+      spot: this.spot,
+      futures_T: items.map(i => i.T), futures_F: items.map(i => i.mark),
+      futures_names: Object.keys(this.data).sort(),
+      curve_T: curveT, curve_F: curveF, curve_r: curveR,
+      table: items.map(i => ({
+        name: Object.keys(this.data).find(k => this.data[k] === i) || '?',
+        T: i.T, mark: i.mark,
+        rate: (Math.log(i.mark / this.spot) / i.T * 100),
+      })),
+    };
+  }
+}
+
+// ====================================================================
+//  ENGINE — manages WS connections + calibration
+// ====================================================================
+const rateModel = new RateModel();
+let optionData = {};    // { instrument_name: { strike, type, mark_iv } }
+let currentExpiry = null;
+let expiryDt = null;    // Date object (UTC 08:00 on expiry day)
+let futuresMeta = [];   // [{ name, expiry_dt }]
+let futuresWs = null;
+let optionsWs = null;
+let lastCalibTime = 0;
+let latestVol = null;   // last calibration result
+
+function parseExpiryDate(s) {
+  // e.g. "24APR26" -> Date
+  const months = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
+  const day = parseInt(s.slice(0,s.search(/[A-Z]/)));
+  const monStr = s.replace(/[0-9]/g,'');
+  const year = parseInt(s.slice(-2)) + 2000;
+  return new Date(Date.UTC(year, months[monStr], day, 8, 0, 0));
+}
+
+function yearFrac(dt) {
+  return (dt.getTime() - Date.now()) / (365.25*24*3600*1000);
+}
+
+// ---- Deribit REST helper ----
+async function deribitGet(endpoint, params={}) {
+  const url = new URL(baseUrl() + '/' + endpoint);
+  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
+  const r = await fetch(url);
+  const data = await r.json();
+  return data.result || null;
+}
+
+// ---- Load futures ----
+async function loadFutures() {
+  const instruments = await deribitGet('public/get_instruments', {currency:'BTC', kind:'future'});
+  if (!instruments) return;
+  futuresMeta = [];
+  const now = new Date();
+  for (const inst of instruments) {
+    if (inst.settlement_currency !== 'BTC') continue;
+    if (inst.instrument_name === 'BTC-PERPETUAL') continue;
+    const expDt = new Date(inst.expiration_timestamp);
+    const T = (expDt - now) / (365.25*24*3600*1000);
+    if (T > 0) futuresMeta.push({ name: inst.instrument_name, expiry_dt: expDt, T });
+  }
+  futuresMeta.sort((a,b) => a.T - b.T);
+
+  // Seed from REST
+  const perpTicker = await deribitGet('public/ticker', {instrument_name:'BTC-PERPETUAL'});
+  if (perpTicker && perpTicker.index_price > 0) {
+    rateModel.updateSpot(perpTicker.index_price);
+  }
+  for (const fm of futuresMeta) {
+    const t = await deribitGet('public/ticker', {instrument_name: fm.name});
+    if (t && t.mark_price > 0) {
+      const T = (fm.expiry_dt - new Date()) / (365.25*24*3600*1000);
+      if (T > 0) rateModel.updateFuture(fm.name, T, t.mark_price);
+    }
+  }
+  console.log(`[Futures] Seeded ${Object.keys(rateModel.data).length} futures, spot=$${rateModel.spot}`);
+  startFuturesWs();
+}
+
+// ---- Futures WebSocket ----
+function startFuturesWs() {
+  if (futuresWs) { futuresWs.close(); futuresWs = null; }
+  const ws = new WebSocket(wsUrl());
+  futuresWs = ws;
+  ws.onopen = () => {
+    const channels = futuresMeta.map(f => `ticker.${f.name}.agg2`);
+    channels.push('ticker.BTC-PERPETUAL.agg2');
+    ws.send(JSON.stringify({jsonrpc:'2.0',id:999,method:'public/subscribe',params:{channels}}));
+    console.log(`[Futures WS] Subscribed to ${channels.length} channels`);
+  };
+  ws.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    if (data.method !== 'subscription') return;
+    const tick = data.params.data;
+    const name = tick.instrument_name;
+    if (name === 'BTC-PERPETUAL') {
+      if (tick.index_price > 0) rateModel.updateSpot(tick.index_price);
+      return;
+    }
+    if (tick.mark_price > 0) {
+      const fm = futuresMeta.find(f => f.name === name);
+      if (fm) {
+        const T = (fm.expiry_dt - new Date()) / (365.25*24*3600*1000);
+        if (T > 0) rateModel.updateFuture(name, T, tick.mark_price);
+      }
+    }
+  };
+  ws.onclose = () => { console.log('[Futures WS] Closed'); setTimeout(startFuturesWs, 3000); };
+  ws.onerror = (e) => console.log('[Futures WS] Error', e);
+}
+
+// ---- Load expiries ----
+async function loadExpiries() {
+  const instruments = await deribitGet('public/get_instruments', {currency:'BTC', kind:'option'});
+  if (!instruments) return [];
+  const expSet = new Set();
+  for (const i of instruments) {
+    if (i.settlement_currency !== 'BTC') continue;
+    expSet.add(i.instrument_name.split('-')[1]);
+  }
+  return [...expSet].sort((a,b) => parseExpiryDate(a) - parseExpiryDate(b));
+}
+
+// ---- Switch expiry ----
+async function switchExpiry(expiry) {
+  if (optionsWs) { optionsWs.close(); optionsWs = null; }
+  currentExpiry = expiry;
+  expiryDt = parseExpiryDate(expiry);
+  optionData = {};
+  latestVol = null;
+  lastCalibTime = 0;
+  document.getElementById('status-text').textContent = 'Switching...';
+
+  // Load option instruments
+  const instruments = await deribitGet('public/get_instruments', {currency:'BTC', kind:'option'});
+  if (!instruments) return;
+  for (const i of instruments) {
+    if (i.settlement_currency !== 'BTC') continue;
+    if (i.instrument_name.split('-')[1] !== expiry) continue;
+    optionData[i.instrument_name] = { strike: i.strike, type: i.option_type, mark_iv: null };
+  }
+  console.log(`[Options] ${Object.keys(optionData).length} instruments for ${expiry}`);
+  startOptionsWs();
+}
+
+// ---- Options WebSocket ----
+function startOptionsWs() {
+  if (optionsWs) { optionsWs.close(); optionsWs = null; }
+  const ws = new WebSocket(wsUrl());
+  optionsWs = ws;
+  ws.onopen = () => {
+    const names = Object.keys(optionData);
+    // Subscribe in batches of 50
+    for (let i = 0; i < names.length; i += 50) {
+      const channels = names.slice(i, i+50).map(n => `ticker.${n}.agg2`);
+      ws.send(JSON.stringify({jsonrpc:'2.0',id:i,method:'public/subscribe',params:{channels}}));
+    }
+    console.log(`[Options WS] Subscribed to ${names.length} channels for ${currentExpiry}`);
+    document.getElementById('status-text').textContent = 'Waiting for data...';
+  };
+  ws.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    if (data.method !== 'subscription') return;
+    const tick = data.params.data;
+    const name = tick.instrument_name;
+    if (name in optionData && tick.mark_iv > 0) {
+      optionData[name].mark_iv = tick.mark_iv;
+    }
+    maybeCalibrate();
+  };
+  ws.onclose = () => { console.log('[Options WS] Closed'); if (currentExpiry) setTimeout(startOptionsWs, 3000); };
+  ws.onerror = (e) => console.log('[Options WS] Error', e);
+}
+
+// ---- Calibration ----
+function getForwardForExpiry() {
+  if (!currentExpiry || !expiryDt) return [null, null];
+  const T = yearFrac(expiryDt);
+  if (T <= 0) return [null, null];
+  const futureName = 'BTC-' + currentExpiry;
+  if (rateModel.data[futureName]) {
+    return [rateModel.data[futureName].mark, 'future (' + futureName + ')'];
+  }
+  const F = rateModel.getForward(T);
+  if (F && F > 0) return [F, 'rate model (interpolated)'];
+  return [null, null];
+}
+
+function maybeCalibrate() {
+  const now = Date.now();
+  if (now - lastCalibTime < 2000) return;
+  lastCalibTime = now;
+
+  if (!expiryDt) return;
+  const T = yearFrac(expiryDt);
+  if (T <= 0) return;
+  const [F, fSource] = getForwardForExpiry();
+  if (!F) return;
+
+  // Collect OTM options
+  const strikes = [], ivs = [];
+  for (const [name, d] of Object.entries(optionData)) {
+    if (!d.mark_iv || d.mark_iv <= 0) continue;
+    const K = d.strike, otype = d.type;
+    if ((otype === 'put' && K < F) || (otype === 'call' && K >= F)) {
+      strikes.push(K);
+      ivs.push(d.mark_iv / 100);
+    }
+  }
+  if (strikes.length < 6) return;
+
+  // Sort by log-moneyness
+  const kArr = strikes.map(K => Math.log(K/F));
+  const idx = Array.from({length:strikes.length},(_,i)=>i).sort((a,b) => kArr[a]-kArr[b]);
+  const kSorted = idx.map(i => kArr[i]);
+  const ivSorted = idx.map(i => ivs[i]);
+  const sSorted = idx.map(i => strikes[i]);
+
+  // Filter to |k| < 0.25
+  const mask = kSorted.map(k => Math.abs(k) < 0.25);
+  const kFit = kSorted.filter((_,i) => mask[i]);
+  const ivFit = ivSorted.filter((_,i) => mask[i]);
+  const sFit = sSorted.filter((_,i) => mask[i]);
+  if (kFit.length < 6) return;
+
+  const params = calibrateSVI(kFit, ivFit, T);
+  if (!params) return;
+  const [a, b, rho, m, sigma] = params;
+
+  // SVI curve
+  const kMin = kFit[0] - 0.02, kMax = kFit[kFit.length-1] + 0.02;
+  const sviCurveK = [], sviCurveIV = [], sviCurveS = [];
+  for (let i = 0; i <= 200; i++) {
+    const k = kMin + (kMax-kMin)*i/200;
+    sviCurveK.push(k);
+    sviCurveIV.push(sviIV(k, T, a, b, rho, m, sigma) * 100);
+    sviCurveS.push(F * Math.exp(k));
+  }
+
+  // ATMF
+  const atmfIV = sviIV(0, T, a, b, rho, m, sigma);
+  const callPrem = black76Call(F, F, T, atmfIV) / F;
+  const putPrem = black76Put(F, F, T, atmfIV) / F;
+
+  // RMSE
+  let sse = 0;
+  for (let i = 0; i < kFit.length; i++) {
+    const ivModel = sviIV(kFit[i], T, a, b, rho, m, sigma);
+    sse += (ivModel - ivFit[i]) ** 2;
+  }
+  const rmse = Math.sqrt(sse / kFit.length) * 100;
+
+  // Neighboring strikes
+  let sBelow=null, ivBelowMkt=null, ivBelowSvi=null;
+  let sAbove=null, ivAboveMkt=null, ivAboveSvi=null;
+  for (let i = sFit.length-1; i >= 0; i--) {
+    if (sFit[i] < F) { sBelow=sFit[i]; ivBelowMkt=ivFit[i]*100; ivBelowSvi=sviIV(Math.log(sFit[i]/F),T,a,b,rho,m,sigma)*100; break; }
+  }
+  for (let i = 0; i < sFit.length; i++) {
+    if (sFit[i] >= F) { sAbove=sFit[i]; ivAboveMkt=ivFit[i]*100; ivAboveSvi=sviIV(Math.log(sFit[i]/F),T,a,b,rho,m,sigma)*100; break; }
+  }
+
+  const ts = new Date().toISOString().slice(11,19);
+
+  latestVol = {
+    forward: F, forward_source: fSource, T, n_points: kFit.length,
+    params: {a,b,rho,m,sigma}, rmse, atmf_iv: atmfIV*100,
+    atmf_call: callPrem, atmf_put: putPrem,
+    strike_below: sBelow, iv_below_mkt: ivBelowMkt, iv_below_svi: ivBelowSvi,
+    strike_above: sAbove, iv_above_mkt: ivAboveMkt, iv_above_svi: ivAboveSvi,
+    market_strikes: sFit, market_ivs: ivFit.map(v=>v*100),
+    svi_curve_strikes: sviCurveS, svi_curve_iv: sviCurveIV,
+    ts,
+  };
+}
+
+// ====================================================================
+//  UI
+// ====================================================================
+// Tabs
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(tab.dataset.tab).classList.add('active');
+    window.dispatchEvent(new Event('resize'));
+  });
+});
+
+// Environment toggle
+document.querySelectorAll('input[name="env"]').forEach(radio => {
+  radio.addEventListener('change', async (e) => {
+    ENV = e.target.value;
+    document.getElementById('status-text').textContent = 'Reconnecting...';
+    if (futuresWs) { futuresWs.close(); futuresWs = null; }
+    if (optionsWs) { optionsWs.close(); optionsWs = null; }
+    rateModel.spot = null; rateModel.data = {};
+    latestVol = null;
+    await loadFutures();
+    await initExpiries();
+  });
+});
+
+// Charts
+const chartDiv = document.getElementById('chart');
+Plotly.newPlot(chartDiv, [
+  {x:[],y:[],mode:'markers',name:'Market OTM IV',marker:{color:'#58a6ff',size:6}},
+  {x:[],y:[],mode:'lines',name:'SVI Fit',line:{color:'#f0883e',width:2.5}},
+  {x:[],y:[],mode:'markers',name:'ATMF',marker:{color:'#3fb950',size:11,symbol:'diamond'}},
+], {
+  paper_bgcolor:'#161b22',plot_bgcolor:'#161b22',
+  font:{family:'SF Mono, Fira Code, Consolas, monospace',color:'#8b949e',size:10},
+  xaxis:{title:'Strike ($)',gridcolor:'#21262d',zerolinecolor:'#30363d',tickformat:'$,.0f'},
+  yaxis:{title:'Implied Vol (%)',gridcolor:'#21262d',zerolinecolor:'#30363d',ticksuffix:'%'},
+  legend:{x:0.01,y:0.99,bgcolor:'rgba(0,0,0,0)'},
+  margin:{l:55,r:15,t:15,b:45},
+},{responsive:true,displayModeBar:false});
+
+const futChartDiv = document.getElementById('futures-chart');
+Plotly.newPlot(futChartDiv, [
+  {x:[],y:[],mode:'markers',name:'Traded Futures',marker:{color:'#58a6ff',size:8}},
+  {x:[],y:[],mode:'lines',name:'Rate Model',line:{color:'#f0883e',width:2}},
+  {x:[0],y:[0],mode:'markers',name:'Spot',marker:{color:'#3fb950',size:10,symbol:'diamond'}},
+], {
+  paper_bgcolor:'#161b22',plot_bgcolor:'#161b22',
+  font:{family:'SF Mono, Fira Code, Consolas, monospace',color:'#8b949e',size:10},
+  xaxis:{title:'Time to Expiry (years)',gridcolor:'#21262d',zerolinecolor:'#30363d'},
+  yaxis:{title:'Price ($)',gridcolor:'#21262d',zerolinecolor:'#30363d',tickformat:'$,.0f'},
+  legend:{x:0.01,y:0.99,bgcolor:'rgba(0,0,0,0)'},
+  margin:{l:65,r:15,t:15,b:45},
+},{responsive:true,displayModeBar:false});
+
+const rateChartDiv = document.getElementById('rate-chart');
+Plotly.newPlot(rateChartDiv, [
+  {x:[],y:[],mode:'lines',name:'Short Rate',line:{color:'#d2a8ff',width:2}},
+  {x:[],y:[],mode:'markers',name:'Futures-implied',marker:{color:'#58a6ff',size:6}},
+], {
+  paper_bgcolor:'#161b22',plot_bgcolor:'#161b22',
+  font:{family:'SF Mono, Fira Code, Consolas, monospace',color:'#8b949e',size:9},
+  xaxis:{title:'T (yr)',gridcolor:'#21262d'},
+  yaxis:{title:'Rate (%)',gridcolor:'#21262d',ticksuffix:'%'},
+  legend:{x:0.01,y:0.99,bgcolor:'rgba(0,0,0,0)',font:{size:9}},
+  margin:{l:45,r:10,t:5,b:35},
+},{responsive:true,displayModeBar:false});
+
+function fmt(v,dec) { return v!=null ? v.toFixed(dec) : '\u2014'; }
+
+// ---- UI Update loops ----
+function updateVolUI() {
+  const d = latestVol;
+  if (!d) { document.getElementById('status-text').textContent = 'Waiting for data...'; return; }
+  document.getElementById('status-text').textContent = 'Live \u2014 ' + d.ts + ' UTC';
+  document.getElementById('v-forward').textContent = '$' + d.forward.toLocaleString(undefined,{maximumFractionDigits:2});
+  document.getElementById('v-fwd-source').textContent = d.forward_source || '\u2014';
+  document.getElementById('v-T').textContent = fmt(d.T,6)+'y';
+  document.getElementById('v-npoints').textContent = d.n_points;
+  document.getElementById('v-ts').textContent = d.ts;
+  if(d.params){
+    document.getElementById('v-a').textContent=fmt(d.params.a,6);
+    document.getElementById('v-b').textContent=fmt(d.params.b,6);
+    document.getElementById('v-rho').textContent=fmt(d.params.rho,6);
+    document.getElementById('v-m').textContent=fmt(d.params.m,6);
+    document.getElementById('v-sigma').textContent=fmt(d.params.sigma,6);
+  }
+  const rmseEl=document.getElementById('v-rmse');
+  rmseEl.textContent=fmt(d.rmse,4)+'%';
+  rmseEl.className='param-value '+(d.rmse<0.25?'green':d.rmse<0.5?'yellow':'red');
+  document.getElementById('v-call').textContent=d.atmf_call!=null?d.atmf_call.toFixed(6)+' BTC':'\u2014';
+  document.getElementById('v-put').textContent=d.atmf_put!=null?d.atmf_put.toFixed(6)+' BTC':'\u2014';
+
+  let rows='';
+  if(d.strike_below) rows+='<tr><td>$'+d.strike_below.toLocaleString()+'</td><td>'+fmt(d.iv_below_mkt,2)+'%</td><td>'+fmt(d.iv_below_svi,2)+'%</td></tr>';
+  rows+='<tr class="atmf"><td>$'+d.forward.toLocaleString(undefined,{maximumFractionDigits:2})+' (F)</td><td>\u2014</td><td>'+fmt(d.atmf_iv,2)+'%</td></tr>';
+  if(d.strike_above) rows+='<tr><td>$'+d.strike_above.toLocaleString()+'</td><td>'+fmt(d.iv_above_mkt,2)+'%</td><td>'+fmt(d.iv_above_svi,2)+'%</td></tr>';
+  document.getElementById('strike-body').innerHTML=rows;
+
+  Plotly.update(chartDiv,{
+    x:[d.market_strikes,d.svi_curve_strikes,d.forward?[d.forward]:[]],
+    y:[d.market_ivs,d.svi_curve_iv,d.atmf_iv!=null?[d.atmf_iv]:[]],
+  },{},[0,1,2]);
+}
+
+function updateFuturesUI() {
+  const d = rateModel.getCurveData();
+  if(!d) return;
+  document.getElementById('vf-spot').textContent='$'+d.spot.toLocaleString(undefined,{maximumFractionDigits:2});
+  document.getElementById('v-spot').textContent='$'+d.spot.toLocaleString(undefined,{maximumFractionDigits:2});
+  if(d.table&&d.table.length>0){
+    let rows='';
+    d.table.forEach(f=>{rows+='<tr><td>'+f.name+'</td><td>'+f.T.toFixed(4)+'</td><td>$'+f.mark.toLocaleString(undefined,{maximumFractionDigits:2})+'</td><td>'+f.rate.toFixed(3)+'%</td></tr>';});
+    document.getElementById('futures-body').innerHTML=rows;
+  }
+  Plotly.update(futChartDiv,{x:[d.futures_T,d.curve_T,[0]],y:[d.futures_F,d.curve_F,[d.spot]]},{},[0,1,2]);
+  if(d.table&&d.table.length>0){
+    Plotly.update(rateChartDiv,{x:[d.curve_T,d.table.map(f=>f.T)],y:[d.curve_r,d.table.map(f=>f.rate)]},{},[0,1]);
+  }
+}
+
+// ---- Init ----
+const expirySelect = document.getElementById('expiry-select');
+expirySelect.addEventListener('change', () => switchExpiry(expirySelect.value));
+
+async function initExpiries() {
+  const expiries = await loadExpiries();
+  expirySelect.innerHTML = '';
+  expiries.forEach(exp => {
+    const opt = document.createElement('option');
+    opt.value = exp; opt.textContent = exp;
+    expirySelect.appendChild(opt);
+  });
+  const def = expiries.includes('24APR26') ? '24APR26' : expiries[0];
+  if (def) { expirySelect.value = def; await switchExpiry(def); }
+}
+
+async function init() {
+  await loadFutures();
+  await initExpiries();
+  setInterval(updateVolUI, 1500);
+  setInterval(updateFuturesUI, 2000);
+}
+
+init();
+</script>
+</body>
+</html>
