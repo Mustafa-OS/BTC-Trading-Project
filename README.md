@@ -21,11 +21,11 @@ Live implied volatility surface for BTC options on Deribit, running entirely in 
 
 ## Usage
 
-Open **[mustafa-os.github.io/btc-vol-surface](https://mustafa-os.github.io/btc-vol-surface/)** in your browser. No installation required.
+Open **[mustafa-os.github.io/BTC-Trading-Project](https://mustafa-os.github.io/BTC-Trading-Project/)** in your browser. No installation required.
 
 Or run locally:
 ```
-git clone https://github.com/Mustafa-OS/btc-vol-surface.git
+git clone https://github.com/Mustafa-OS/BTC-Trading-Project.git
 open index.html
 ```
 
