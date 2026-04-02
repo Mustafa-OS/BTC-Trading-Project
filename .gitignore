@@ -1,10 +1,8 @@
-# Private files with API keys — never commit these
-svi_ui.py
+# Private files with hardcoded API keys — never commit these
 test.py
 bot.py
 realtime.py
 svi.py
-svi_public.py
 
 # Data files
 *.csv
