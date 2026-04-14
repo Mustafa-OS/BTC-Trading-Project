@@ -1600,9 +1600,435 @@ class SVIEngine:
         return trades if trades else None
 
 
+# ====== AUTO HEDGER (Gamma-Aware Delta Hedging) ======
+class AutoHedger:
+    """Continuously monitors portfolio delta and rebalances via BTC-PERPETUAL.
+
+    Gamma awareness: when |gamma| is large, use tighter delta bands and hedge more
+    frequently, because delta changes rapidly with spot. When |gamma| is small,
+    wider bands are acceptable.
+    """
+
+    def __init__(self, engine_ref):
+        self.engine = engine_ref
+        self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+
+        # Configurable parameters
+        self.base_delta_threshold = 0.02   # BTC — hedge when |delta| exceeds this
+        self.gamma_scaling = True          # tighten threshold when gamma is large
+        self.check_interval = 30           # seconds between checks
+        self.min_trade_usd = 10            # Deribit minimum
+        self.max_trade_usd = 100000        # safety cap per hedge
+
+        # Log of actions (ring buffer)
+        self.log = deque(maxlen=500)
+        self.stats = {"hedges": 0, "total_traded_usd": 0, "last_hedge_ts": None}
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        self._add_log("AUTO HEDGE STARTED", f"threshold={self.base_delta_threshold:.4f} BTC, "
+                       f"interval={self.check_interval}s, gamma_scaling={'ON' if self.gamma_scaling else 'OFF'}")
+
+    def stop(self):
+        self.running = False
+        self._add_log("AUTO HEDGE STOPPED", "")
+
+    def update_params(self, threshold=None, interval=None, gamma_scaling=None, max_trade=None):
+        with self.lock:
+            if threshold is not None:
+                self.base_delta_threshold = threshold
+            if interval is not None:
+                self.check_interval = max(5, int(interval))
+            if gamma_scaling is not None:
+                self.gamma_scaling = gamma_scaling
+            if max_trade is not None:
+                self.max_trade_usd = max_trade
+        self._add_log("PARAMS UPDATED",
+                       f"threshold={self.base_delta_threshold:.4f}, interval={self.check_interval}s, "
+                       f"gamma={'ON' if self.gamma_scaling else 'OFF'}, max=${self.max_trade_usd:,.0f}")
+
+    def get_status(self):
+        with self.lock:
+            return {
+                "running": self.running,
+                "threshold": self.base_delta_threshold,
+                "interval": self.check_interval,
+                "gamma_scaling": self.gamma_scaling,
+                "max_trade_usd": self.max_trade_usd,
+                "stats": dict(self.stats),
+                "log": list(self.log),
+            }
+
+    def _add_log(self, action, detail):
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        entry = {"ts": ts, "action": action, "detail": detail}
+        with self.lock:
+            self.log.append(entry)
+        print(f"[AutoHedge] {ts} {action}: {detail}")
+
+    def _loop(self):
+        while self.running:
+            try:
+                self._check_and_hedge()
+            except Exception as e:
+                self._add_log("ERROR", str(e))
+                traceback.print_exc()
+            # Sleep in small increments so stop() is responsive
+            for _ in range(self.check_interval):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def _get_effective_threshold(self, gamma_1pct):
+        """Adjust delta threshold based on portfolio gamma.
+
+        When gamma is large, delta changes quickly with spot, so we hedge
+        more aggressively (tighter bands). The scaling is:
+          effective = base_threshold / (1 + k * |gamma|)
+        where k is tuned so that gamma of 0.01 BTC halves the threshold.
+        """
+        if not self.gamma_scaling or abs(gamma_1pct) < 1e-8:
+            return self.base_delta_threshold
+
+        # k=50: gamma of 0.01 → divisor = 1.5, gamma of 0.05 → divisor = 3.5
+        k = 50.0
+        divisor = 1.0 + k * abs(gamma_1pct)
+        effective = self.base_delta_threshold / divisor
+        # Floor at 20% of base to prevent infinite tightening
+        return max(effective, self.base_delta_threshold * 0.2)
+
+    def _check_and_hedge(self):
+        with self.engine.lock:
+            risk = dict(self.engine.risk_data)
+            spot = self.engine.spot_price or 0
+
+        totals = risk.get("totals", {})
+        if not totals or not spot:
+            self._add_log("SKIP", "No risk data or spot price available")
+            return
+
+        bs_delta = totals.get("bs_delta", 0)
+        gamma_1pct = totals.get("gamma_1pct", 0)
+
+        with self.lock:
+            effective_threshold = self._get_effective_threshold(gamma_1pct)
+
+        self._add_log("CHECK",
+                       f"delta={bs_delta:+.6f} BTC, gamma={gamma_1pct:+.6f}, "
+                       f"threshold={effective_threshold:.4f}")
+
+        if abs(bs_delta) <= effective_threshold:
+            return  # within tolerance
+
+        # Compute hedge trade
+        hedge_usd = round(-bs_delta * spot)
+        hedge_usd = round(hedge_usd / 10) * 10  # Deribit $10 increments
+
+        if abs(hedge_usd) < self.min_trade_usd:
+            self._add_log("SKIP", f"Hedge too small: ${abs(hedge_usd)}")
+            return
+
+        with self.lock:
+            cap = self.max_trade_usd
+        if abs(hedge_usd) > cap:
+            self._add_log("CAPPED", f"Hedge ${abs(hedge_usd):,.0f} capped to ${cap:,.0f}")
+            hedge_usd = int(math.copysign(cap, hedge_usd))
+            hedge_usd = round(hedge_usd / 10) * 10
+
+        direction = "buy" if hedge_usd > 0 else "sell"
+        size = abs(hedge_usd)
+
+        self._add_log("HEDGING",
+                       f"{direction.upper()} ${size:,} BTC-PERPETUAL "
+                       f"(delta was {bs_delta:+.6f}, gamma={gamma_1pct:+.6f})")
+
+        result = self.engine.execute_order_ws("BTC-PERPETUAL", direction, size)
+
+        if result.get("ok"):
+            with self.lock:
+                self.stats["hedges"] += 1
+                self.stats["total_traded_usd"] += size
+                self.stats["last_hedge_ts"] = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            self._add_log("FILLED",
+                           f"${size:,} @ ${result.get('average_price', 0):,.2f} "
+                           f"(filled {result.get('filled_amount', 0)})")
+            # Trigger risk refresh so next check has updated delta
+            try:
+                self.engine._compute_risk()
+            except Exception:
+                pass
+        else:
+            self._add_log("FAILED", result.get("error", "Unknown error"))
+
+
+# ====== BACKTEST ENGINE ======
+class BacktestEngine:
+    """Replay historical price data and simulate a delta-hedging strategy.
+
+    Fetches OHLCV candles from Deribit, simulates an options portfolio,
+    and delta-hedges at configurable intervals. Reports PnL, Sharpe, drawdown.
+    """
+
+    @staticmethod
+    def fetch_candles(instrument, resolution, start_ts, end_ts):
+        """Fetch historical candles from Deribit's public API.
+        resolution: '1' (1min), '5', '15', '30', '60', '1D'
+        timestamps in ms.
+        """
+        all_candles = []
+        cursor = start_ts
+        while cursor < end_ts:
+            params = {
+                "instrument_name": instrument,
+                "resolution": resolution,
+                "start_timestamp": int(cursor),
+                "end_timestamp": int(end_ts),
+                "count": 5000,
+            }
+            data = api_call("public/get_tradingview_chart_data", params)
+            if not data or "ticks" not in data:
+                break
+            ticks = data["ticks"]
+            closes = data["close"]
+            highs = data["high"]
+            lows = data["low"]
+            opens = data["open"]
+            volumes = data.get("volume", [0] * len(ticks))
+            for i in range(len(ticks)):
+                all_candles.append({
+                    "ts": ticks[i],
+                    "open": opens[i],
+                    "high": highs[i],
+                    "low": lows[i],
+                    "close": closes[i],
+                    "volume": volumes[i],
+                })
+            if len(ticks) < 2:
+                break
+            cursor = ticks[-1] + 1  # next candle after last
+        return all_candles
+
+    @staticmethod
+    def run_delta_hedge_backtest(params):
+        """Run a delta-hedging backtest.
+
+        params:
+          - instrument: e.g. "BTC-PERPETUAL"
+          - days: lookback period
+          - resolution: candle size ('60' = 1h, '1D' = daily)
+          - option_type: 'call' or 'put'
+          - strike_offset_pct: strike as % offset from initial spot (0 = ATM)
+          - option_size: number of option contracts (in BTC)
+          - option_direction: 'buy' or 'sell'
+          - iv: assumed constant IV (decimal, e.g. 0.60)
+          - tte: time to expiry at start (years, e.g. 0.0833 ≈ 30 days)
+          - hedge_interval: how many candles between rehedges
+          - cost_per_trade: transaction cost as fraction (e.g. 0.0005)
+          - delta_threshold: only hedge when |delta change| exceeds this
+        """
+        instrument = params.get("instrument", "BTC-PERPETUAL")
+        days = params.get("days", 30)
+        resolution = params.get("resolution", "60")
+        option_type = params.get("option_type", "call")
+        strike_offset_pct = params.get("strike_offset_pct", 0)
+        option_size = params.get("option_size", 1.0)
+        option_direction = params.get("option_direction", "sell")
+        iv = params.get("iv", 0.60)
+        tte = params.get("tte", 30.0 / 365.25)
+        hedge_interval = params.get("hedge_interval", 1)
+        cost_per_trade = params.get("cost_per_trade", 0.0005)
+        delta_threshold = params.get("delta_threshold", 0.001)
+
+        # Fetch candles
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - int(days * 24 * 3600 * 1000)
+        candles = BacktestEngine.fetch_candles(instrument, resolution, start_ms, now_ms)
+
+        if len(candles) < 10:
+            return {"error": f"Not enough data: only {len(candles)} candles"}
+
+        # Determine time step per candle (in years)
+        if resolution == "1D":
+            dt_years = 1.0 / 365.25
+        else:
+            dt_years = int(resolution) / (365.25 * 24 * 60)
+
+        # Setup
+        prices = [c["close"] for c in candles]
+        timestamps = [c["ts"] for c in candles]
+        S0 = prices[0]
+        K = S0 * (1.0 + strike_offset_pct / 100.0)
+        sign = 1.0 if option_direction == "buy" else -1.0
+        bs_fn = black76_call if option_type == "call" else black76_put
+
+        # Initial option value (in USD)
+        T_remaining = tte
+        initial_option_usd = bs_fn(S0, K, T_remaining, iv)
+        initial_premium_btc = sign * option_size * initial_option_usd / S0
+
+        # Initial delta hedge
+        eps = S0 * 0.0005
+        v_up = bs_fn(S0 + eps, K, T_remaining, iv)
+        v_dn = bs_fn(S0 - eps, K, T_remaining, iv)
+        option_delta = sign * option_size * (v_up - v_dn) / (2.0 * eps)
+        perp_position = -option_delta  # hedge: opposite delta
+        # perp_position is in BTC-equivalent (delta units)
+
+        # Track
+        results = []
+        total_costs = 0.0
+        hedge_count = 0
+        candle_since_hedge = 0
+        prev_delta = option_delta
+
+        for i, price in enumerate(prices):
+            T_remaining = max(tte - i * dt_years, 1e-6)
+            F = price  # for perpetual, F ≈ spot
+
+            # Compute option greeks
+            eps = F * 0.0005
+            v_usd = bs_fn(F, K, T_remaining, iv)
+            v_up = bs_fn(F + eps, K, T_remaining, iv)
+            v_dn = bs_fn(F - eps, K, T_remaining, iv)
+            current_delta = sign * option_size * (v_up - v_dn) / (2.0 * eps)
+
+            # Gamma (change in delta for 1% move)
+            F_u = F * 1.01
+            F_d = F * 0.99
+            eu = F_u * 0.0005
+            ed = F_d * 0.0005
+            d_up = sign * option_size * (bs_fn(F_u + eu, K, T_remaining, iv) - bs_fn(F_u - eu, K, T_remaining, iv)) / (2.0 * eu)
+            d_dn = sign * option_size * (bs_fn(F_d + ed, K, T_remaining, iv) - bs_fn(F_d - ed, K, T_remaining, iv)) / (2.0 * ed)
+            gamma_1pct = (d_up - d_dn) / 2.0
+
+            # Portfolio delta = option delta + perp delta
+            portfolio_delta = current_delta + perp_position
+
+            # Check if we should rehedge
+            candle_since_hedge += 1
+            did_hedge = False
+            trade_size_usd = 0
+
+            if candle_since_hedge >= hedge_interval and abs(portfolio_delta) > delta_threshold:
+                # Rehedge: trade perp to flatten delta
+                trade_delta = -portfolio_delta
+                trade_size_usd = abs(trade_delta * F)
+                cost = trade_size_usd * cost_per_trade
+                total_costs += cost
+                perp_position += trade_delta
+                portfolio_delta = current_delta + perp_position
+                hedge_count += 1
+                candle_since_hedge = 0
+                did_hedge = True
+
+            # Option PnL (in BTC): V_btc = V_usd / F
+            option_btc = sign * option_size * v_usd / F
+            # Perp PnL (cumulative, inverse): sum of position * (1/F_prev - 1/F_curr)
+            # We track this incrementally
+            if i == 0:
+                perp_pnl_btc = 0.0
+                prev_price = F
+            else:
+                # Perp PnL this step: position * (1/prev_price - 1/price)
+                perp_pnl_step = perp_position * (1.0 / prev_price - 1.0 / price) * prev_price  # simplified
+                # Actually for inverse perp: PnL in BTC = contracts_usd * (1/entry - 1/exit)
+                # But we're tracking BTC-equivalent position, so:
+                # PnL_btc = perp_delta * (price - prev_price) / price (approx for small moves)
+                perp_pnl_step = perp_position * (price - prev_price) / price
+                perp_pnl_btc += perp_pnl_step
+                prev_price = price
+
+            # Total portfolio BTC value
+            total_btc = option_btc + perp_pnl_btc - total_costs / F + initial_premium_btc
+
+            ts_str = datetime.fromtimestamp(timestamps[i] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+            results.append({
+                "ts": ts_str,
+                "price": round(price, 2),
+                "T_remaining": round(T_remaining, 6),
+                "option_delta": round(current_delta, 6),
+                "portfolio_delta": round(portfolio_delta, 6),
+                "gamma_1pct": round(gamma_1pct, 6),
+                "option_value_btc": round(option_btc, 8),
+                "perp_pnl_btc": round(perp_pnl_btc, 8),
+                "total_costs_btc": round(total_costs / F, 8),
+                "total_btc": round(total_btc, 8),
+                "hedged": did_hedge,
+                "trade_size_usd": round(trade_size_usd, 0),
+            })
+
+            prev_delta = current_delta
+
+        # Performance metrics
+        if len(results) < 2:
+            return {"error": "Not enough results to compute metrics"}
+
+        pnl_series = [r["total_btc"] for r in results]
+        returns = [(pnl_series[i] - pnl_series[i - 1]) for i in range(1, len(pnl_series))]
+        final_pnl = pnl_series[-1] - pnl_series[0]
+
+        # Sharpe (annualized)
+        if len(returns) > 1:
+            mean_ret = np.mean(returns)
+            std_ret = np.std(returns)
+            # Annualize: depends on resolution
+            if resolution == "1D":
+                periods_per_year = 365.25
+            else:
+                periods_per_year = 365.25 * 24 * 60 / int(resolution)
+            sharpe = (mean_ret / std_ret * math.sqrt(periods_per_year)) if std_ret > 0 else 0
+        else:
+            sharpe = 0
+
+        # Max drawdown
+        peak = pnl_series[0]
+        max_dd = 0
+        for v in pnl_series:
+            if v > peak:
+                peak = v
+            dd = peak - v
+            if dd > max_dd:
+                max_dd = dd
+
+        return {
+            "results": results,
+            "metrics": {
+                "total_pnl_btc": round(final_pnl, 8),
+                "sharpe": round(sharpe, 3),
+                "max_drawdown_btc": round(max_dd, 8),
+                "hedge_count": hedge_count,
+                "total_costs_btc": round(total_costs / prices[-1], 8),
+                "total_traded_usd": round(sum(r["trade_size_usd"] for r in results), 0),
+                "n_candles": len(results),
+                "initial_price": round(prices[0], 2),
+                "final_price": round(prices[-1], 2),
+                "strike": round(K, 2),
+                "option_type": option_type,
+                "option_direction": option_direction,
+                "option_size": option_size,
+                "iv": round(iv * 100, 1),
+            },
+            "timestamps": [r["ts"] for r in results],
+            "prices": [r["price"] for r in results],
+            "portfolio_delta": [r["portfolio_delta"] for r in results],
+            "gamma": [r["gamma_1pct"] for r in results],
+            "total_btc": [r["total_btc"] for r in results],
+            "option_value": [r["option_value_btc"] for r in results],
+            "perp_pnl": [r["perp_pnl_btc"] for r in results],
+        }
+
+
 # ====== FLASK APP ======
 app = Flask(__name__)
 engine = SVIEngine()
+auto_hedger = AutoHedger(engine)
 
 HTML_PAGE = r"""
 <!DOCTYPE html>
@@ -1850,6 +2276,8 @@ HTML_PAGE = r"""
   <button class="tab" data-tab="hedge-tab">Hedge</button>
   <button class="tab" data-tab="pnl-tab">P&amp;L</button>
   <button class="tab" data-tab="recon-tab">Recon</button>
+  <button class="tab" data-tab="autohedge-tab">Auto Hedge</button>
+  <button class="tab" data-tab="backtest-tab">Backtest</button>
 </div>
 
 <!-- Vol Smile Tab -->
@@ -2126,6 +2554,183 @@ HTML_PAGE = r"""
       </div>
       <div id="h-empty" class="hedge-no-trades">
         Select which greeks to flatten and click <strong>Calculate Hedge</strong>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Auto Hedge Tab -->
+<div id="autohedge-tab" class="tab-content">
+  <div class="hedge-layout">
+    <div>
+      <div class="hedge-controls">
+        <h2>Auto Delta Hedger</h2>
+        <p style="font-size:11px;color:#8b949e;margin-bottom:16px;line-height:1.5;">
+          Continuously monitors portfolio delta and hedges via BTC-PERPETUAL.
+          When gamma is large, the hedger tightens its delta threshold automatically.
+        </p>
+
+        <div style="margin-bottom:12px;">
+          <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">DELTA THRESHOLD (BTC)</div>
+          <input type="number" id="ah-threshold" value="0.02" step="0.005" min="0.001" max="1"
+            style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:13px;">
+          <div style="font-size:10px;color:#484f58;margin-top:2px;">Hedge when |delta| exceeds this. Gamma scaling adjusts dynamically.</div>
+        </div>
+
+        <div style="margin-bottom:12px;">
+          <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">CHECK INTERVAL (seconds)</div>
+          <input type="number" id="ah-interval" value="30" step="5" min="5" max="600"
+            style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:13px;">
+        </div>
+
+        <div style="margin-bottom:12px;">
+          <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">MAX TRADE SIZE (USD)</div>
+          <input type="number" id="ah-max-trade" value="100000" step="1000" min="10"
+            style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:13px;">
+        </div>
+
+        <label class="hedge-check" style="margin-bottom:16px;">
+          <input type="checkbox" id="ah-gamma-scaling" checked>
+          <span>Gamma Scaling</span>
+          <span class="sub">— tighten threshold when gamma is large</span>
+        </label>
+
+        <div style="display:flex;gap:8px;">
+          <button class="hedge-btn" id="ah-start-btn" onclick="toggleAutoHedge()" style="flex:1;background:#238636;">Start Auto Hedge</button>
+          <button class="hedge-btn" id="ah-update-btn" onclick="updateAutoHedgeParams()" style="flex:1;background:#30363d;">Update Params</button>
+        </div>
+
+        <div style="margin-top:12px;font-size:11px;color:#484f58;" id="ah-status-text"></div>
+      </div>
+    </div>
+
+    <div style="flex:1;">
+      <div class="card" style="margin-bottom:12px;">
+        <h2>Status</h2>
+        <div class="risk-header" id="ah-stats" style="margin-bottom:0;">
+          <div class="risk-stat"><div class="label">State</div><div class="value" id="ah-state">STOPPED</div></div>
+          <div class="risk-stat"><div class="label">Hedges</div><div class="value" id="ah-hedges">0</div></div>
+          <div class="risk-stat"><div class="label">Total Traded</div><div class="value" id="ah-traded">$0</div></div>
+          <div class="risk-stat"><div class="label">Last Hedge</div><div class="value" id="ah-last">&mdash;</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Activity Log</h2>
+        <div id="ah-log" style="max-height:400px;overflow-y:auto;font-size:11px;font-family:inherit;">
+          <div style="color:#8b949e;padding:20px;text-align:center;">Start auto hedger to see activity</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Backtest Tab -->
+<div id="backtest-tab" class="tab-content">
+  <div class="hedge-layout">
+    <div>
+      <div class="hedge-controls">
+        <h2>Backtest: Delta Hedging</h2>
+        <p style="font-size:11px;color:#8b949e;margin-bottom:16px;line-height:1.5;">
+          Simulate selling (or buying) an option and delta-hedging with the perpetual
+          over historical data. See how hedging frequency and gamma affect P&amp;L.
+        </p>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">OPTION TYPE</div>
+            <select id="bt-option-type" style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+              <option value="call">Call</option>
+              <option value="put">Put</option>
+            </select>
+          </div>
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">DIRECTION</div>
+            <select id="bt-direction" style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+              <option value="sell">Sell (collect premium)</option>
+              <option value="buy">Buy (pay premium)</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">STRIKE OFFSET (%)</div>
+            <input type="number" id="bt-strike-offset" value="0" step="1" min="-50" max="50"
+              style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+            <div style="font-size:10px;color:#484f58;margin-top:2px;">0 = ATM, +5 = 5% OTM call</div>
+          </div>
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">OPTION SIZE (BTC)</div>
+            <input type="number" id="bt-size" value="1" step="0.1" min="0.1" max="100"
+              style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">IMPLIED VOL (%)</div>
+            <input type="number" id="bt-iv" value="60" step="5" min="5" max="300"
+              style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+          </div>
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">TIME TO EXPIRY (days)</div>
+            <input type="number" id="bt-tte" value="30" step="1" min="1" max="365"
+              style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">LOOKBACK (days)</div>
+            <input type="number" id="bt-days" value="30" step="1" min="1" max="365"
+              style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+          </div>
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">CANDLE SIZE</div>
+            <select id="bt-resolution" style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+              <option value="60">1 Hour</option>
+              <option value="30">30 Min</option>
+              <option value="15">15 Min</option>
+              <option value="1D">Daily</option>
+            </select>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px;">
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">HEDGE EVERY N CANDLES</div>
+            <input type="number" id="bt-hedge-interval" value="1" step="1" min="1" max="100"
+              style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+          </div>
+          <div>
+            <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">COST PER TRADE (%)</div>
+            <input type="number" id="bt-cost" value="0.05" step="0.01" min="0" max="1"
+              style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+          </div>
+        </div>
+
+        <div style="margin-bottom:12px;">
+          <div style="font-size:11px;color:#8b949e;margin-bottom:4px;">DELTA THRESHOLD</div>
+          <input type="number" id="bt-delta-thresh" value="0.001" step="0.001" min="0" max="1"
+            style="width:100%;padding:8px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;font-family:inherit;font-size:12px;">
+          <div style="font-size:10px;color:#484f58;margin-top:2px;">Only rehedge when |portfolio delta| exceeds this</div>
+        </div>
+
+        <button class="hedge-btn" id="bt-run-btn" onclick="runBacktest()" style="background:#238636;">Run Backtest</button>
+        <div style="margin-top:8px;font-size:11px;color:#484f58;" id="bt-status"></div>
+      </div>
+    </div>
+
+    <div style="flex:1;">
+      <div id="bt-empty" style="text-align:center;color:#8b949e;padding:60px 20px;font-size:13px;">
+        Configure parameters and click <strong>Run Backtest</strong> to simulate a delta-hedging strategy over historical data.
+      </div>
+      <div id="bt-results" style="display:none;">
+        <div class="risk-header" id="bt-metrics" style="margin-bottom:16px;"></div>
+        <div class="chart-container" style="margin-bottom:12px;"><div id="bt-chart-pnl" style="width:100%;height:300px;"></div></div>
+        <div class="chart-container" style="margin-bottom:12px;"><div id="bt-chart-delta" style="width:100%;height:250px;"></div></div>
+        <div class="chart-container"><div id="bt-chart-price" style="width:100%;height:250px;"></div></div>
       </div>
     </div>
   </div>
@@ -2925,6 +3530,222 @@ function loadRecon() {
     status.style.color = '#f85149';
   });
 }
+
+// ---- Auto Hedge ----
+let ahPolling = null;
+
+function toggleAutoHedge() {
+  const btn = document.getElementById('ah-start-btn');
+  const stateEl = document.getElementById('ah-state');
+
+  if (btn.textContent.includes('Start')) {
+    // Collect params and start
+    const params = {
+      threshold: parseFloat(document.getElementById('ah-threshold').value) || 0.02,
+      interval: parseInt(document.getElementById('ah-interval').value) || 30,
+      gamma_scaling: document.getElementById('ah-gamma-scaling').checked,
+      max_trade: parseFloat(document.getElementById('ah-max-trade').value) || 100000,
+    };
+    fetch('/api/autohedge/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(params)
+    }).then(r => r.json()).then(d => {
+      if (d.ok) {
+        btn.textContent = 'Stop Auto Hedge';
+        btn.style.background = '#f85149';
+        stateEl.textContent = 'RUNNING';
+        stateEl.style.color = '#3fb950';
+        startAhPolling();
+      }
+    });
+  } else {
+    fetch('/api/autohedge/stop', {method: 'POST'}).then(r => r.json()).then(d => {
+      btn.textContent = 'Start Auto Hedge';
+      btn.style.background = '#238636';
+      stateEl.textContent = 'STOPPED';
+      stateEl.style.color = '#e6edf3';
+    });
+  }
+}
+
+function updateAutoHedgeParams() {
+  const params = {
+    threshold: parseFloat(document.getElementById('ah-threshold').value) || 0.02,
+    interval: parseInt(document.getElementById('ah-interval').value) || 30,
+    gamma_scaling: document.getElementById('ah-gamma-scaling').checked,
+    max_trade: parseFloat(document.getElementById('ah-max-trade').value) || 100000,
+  };
+  fetch('/api/autohedge/params', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(params)
+  }).then(r => r.json()).then(d => {
+    document.getElementById('ah-status-text').textContent = d.ok ? 'Parameters updated' : 'Error';
+    document.getElementById('ah-status-text').style.color = d.ok ? '#3fb950' : '#f85149';
+    setTimeout(() => { document.getElementById('ah-status-text').textContent = ''; }, 3000);
+  });
+}
+
+function startAhPolling() {
+  if (ahPolling) return;
+  ahPolling = setInterval(pollAutoHedge, 2000);
+}
+
+function pollAutoHedge() {
+  fetch('/api/autohedge/status').then(r => r.json()).then(d => {
+    const btn = document.getElementById('ah-start-btn');
+    const stateEl = document.getElementById('ah-state');
+
+    if (d.running) {
+      btn.textContent = 'Stop Auto Hedge';
+      btn.style.background = '#f85149';
+      stateEl.textContent = 'RUNNING';
+      stateEl.style.color = '#3fb950';
+    } else {
+      btn.textContent = 'Start Auto Hedge';
+      btn.style.background = '#238636';
+      stateEl.textContent = 'STOPPED';
+      stateEl.style.color = '#e6edf3';
+    }
+
+    document.getElementById('ah-hedges').textContent = d.stats.hedges;
+    document.getElementById('ah-traded').textContent = '$' + (d.stats.total_traded_usd || 0).toLocaleString();
+    document.getElementById('ah-last').textContent = d.stats.last_hedge_ts || '\u2014';
+
+    // Log
+    const logEl = document.getElementById('ah-log');
+    if (d.log && d.log.length > 0) {
+      logEl.innerHTML = d.log.slice().reverse().map(l => {
+        let color = '#8b949e';
+        if (l.action === 'HEDGING' || l.action === 'FILLED') color = '#3fb950';
+        else if (l.action === 'FAILED' || l.action === 'ERROR') color = '#f85149';
+        else if (l.action === 'CAPPED') color = '#d29922';
+        else if (l.action.includes('START')) color = '#58a6ff';
+        else if (l.action.includes('STOP')) color = '#d29922';
+        return `<div style="padding:3px 0;border-bottom:1px solid #21262d;">
+          <span style="color:#484f58;">${l.ts}</span>
+          <span style="color:${color};font-weight:600;margin:0 6px;">${l.action}</span>
+          <span style="color:#8b949e;">${l.detail}</span>
+        </div>`;
+      }).join('');
+    }
+  }).catch(() => {});
+}
+
+// Poll auto hedge status when tab is opened
+document.querySelector('[data-tab="autohedge-tab"]').addEventListener('click', () => {
+  pollAutoHedge();
+  startAhPolling();
+});
+
+// ---- Backtest ----
+function runBacktest() {
+  const btn = document.getElementById('bt-run-btn');
+  const status = document.getElementById('bt-status');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  status.textContent = 'Fetching historical data and running simulation...';
+  status.style.color = '#8b949e';
+
+  const params = {
+    option_type: document.getElementById('bt-option-type').value,
+    option_direction: document.getElementById('bt-direction').value,
+    strike_offset_pct: parseFloat(document.getElementById('bt-strike-offset').value) || 0,
+    option_size: parseFloat(document.getElementById('bt-size').value) || 1,
+    iv: (parseFloat(document.getElementById('bt-iv').value) || 60) / 100,
+    tte: (parseFloat(document.getElementById('bt-tte').value) || 30) / 365.25,
+    days: parseInt(document.getElementById('bt-days').value) || 30,
+    resolution: document.getElementById('bt-resolution').value,
+    hedge_interval: parseInt(document.getElementById('bt-hedge-interval').value) || 1,
+    cost_per_trade: (parseFloat(document.getElementById('bt-cost').value) || 0.05) / 100,
+    delta_threshold: parseFloat(document.getElementById('bt-delta-thresh').value) || 0.001,
+  };
+
+  fetch('/api/backtest', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(params)
+  }).then(r => r.json()).then(d => {
+    btn.disabled = false;
+    btn.textContent = 'Run Backtest';
+
+    if (d.error) {
+      status.textContent = d.error;
+      status.style.color = '#f85149';
+      return;
+    }
+
+    status.textContent = `Completed: ${d.metrics.n_candles} candles, ${d.metrics.hedge_count} hedges`;
+    status.style.color = '#3fb950';
+
+    document.getElementById('bt-empty').style.display = 'none';
+    document.getElementById('bt-results').style.display = 'block';
+
+    // Metrics
+    const m = d.metrics;
+    document.getElementById('bt-metrics').innerHTML = `
+      <div class="risk-stat"><div class="label">Total P&amp;L</div><div class="value ${m.total_pnl_btc >= 0 ? 'green' : 'red'}">${m.total_pnl_btc >= 0 ? '+' : ''}${m.total_pnl_btc.toFixed(6)} BTC</div></div>
+      <div class="risk-stat"><div class="label">Sharpe Ratio</div><div class="value blue">${m.sharpe.toFixed(3)}</div></div>
+      <div class="risk-stat"><div class="label">Max Drawdown</div><div class="value red">${m.max_drawdown_btc.toFixed(6)} BTC</div></div>
+      <div class="risk-stat"><div class="label">Hedges</div><div class="value">${m.hedge_count}</div></div>
+      <div class="risk-stat"><div class="label">Costs</div><div class="value red">${m.total_costs_btc.toFixed(6)} BTC</div></div>
+      <div class="risk-stat"><div class="label">Setup</div><div class="value" style="font-size:12px;">${m.option_direction} ${m.option_size} ${m.option_type} K=$${m.strike.toLocaleString()} IV=${m.iv}%</div></div>
+    `;
+
+    const plotStyle = {
+      paper_bgcolor: '#161b22', plot_bgcolor: '#161b22',
+      font: { family: 'SF Mono, Fira Code, Consolas, monospace', color: '#8b949e', size: 10 },
+      margin: { l: 55, r: 15, t: 25, b: 35 },
+    };
+
+    // PnL chart
+    Plotly.newPlot('bt-chart-pnl', [
+      { x: d.timestamps, y: d.total_btc, name: 'Total Portfolio', line: { color: '#58a6ff', width: 2 } },
+      { x: d.timestamps, y: d.option_value, name: 'Option Value', line: { color: '#f0883e', width: 1, dash: 'dot' } },
+      { x: d.timestamps, y: d.perp_pnl, name: 'Perp Hedge P&L', line: { color: '#d2a8ff', width: 1, dash: 'dot' } },
+    ], {
+      ...plotStyle,
+      title: { text: 'Portfolio P&L (BTC)', font: { size: 12, color: '#8b949e' } },
+      xaxis: { gridcolor: '#21262d' },
+      yaxis: { title: 'BTC', gridcolor: '#21262d' },
+      legend: { x: 0.01, y: 0.99, bgcolor: 'rgba(0,0,0,0)' },
+    }, { responsive: true, displayModeBar: false });
+
+    // Delta chart
+    Plotly.newPlot('bt-chart-delta', [
+      { x: d.timestamps, y: d.portfolio_delta, name: 'Portfolio Delta', line: { color: '#3fb950', width: 1.5 } },
+      { x: d.timestamps, y: d.gamma, name: 'Gamma (1%)', line: { color: '#d29922', width: 1, dash: 'dash' }, yaxis: 'y2' },
+    ], {
+      ...plotStyle,
+      title: { text: 'Delta & Gamma', font: { size: 12, color: '#8b949e' } },
+      xaxis: { gridcolor: '#21262d' },
+      yaxis: { title: 'Delta (BTC)', gridcolor: '#21262d' },
+      yaxis2: { title: 'Gamma', overlaying: 'y', side: 'right', gridcolor: '#21262d20' },
+      legend: { x: 0.01, y: 0.99, bgcolor: 'rgba(0,0,0,0)' },
+    }, { responsive: true, displayModeBar: false });
+
+    // Price chart
+    Plotly.newPlot('bt-chart-price', [
+      { x: d.timestamps, y: d.prices, name: 'BTC Price', line: { color: '#e6edf3', width: 1.5 } },
+      { x: d.timestamps, y: d.prices.map(() => m.strike), name: `Strike $${m.strike.toLocaleString()}`, line: { color: '#f85149', width: 1, dash: 'dash' } },
+    ], {
+      ...plotStyle,
+      title: { text: 'Underlying Price', font: { size: 12, color: '#8b949e' } },
+      xaxis: { gridcolor: '#21262d' },
+      yaxis: { title: 'USD', gridcolor: '#21262d', tickformat: '$,.0f' },
+      legend: { x: 0.01, y: 0.99, bgcolor: 'rgba(0,0,0,0)' },
+    }, { responsive: true, displayModeBar: false });
+
+    window.dispatchEvent(new Event('resize'));
+
+  }).catch(err => {
+    btn.disabled = false;
+    btn.textContent = 'Run Backtest';
+    status.textContent = 'Error: ' + err;
+    status.style.color = '#f85149';
+  });
+}
 </script>
 </body>
 </html>
@@ -3259,6 +4080,51 @@ def api_pnl():
 def api_recon():
     """Fetch all trades, settlements, transfers and reconcile equity."""
     result = engine.compute_reconciliation()
+    return jsonify(result)
+
+
+# ---- Auto Hedge API ----
+@app.route("/api/autohedge/start", methods=["POST"])
+def api_autohedge_start():
+    data = request.get_json() or {}
+    auto_hedger.update_params(
+        threshold=data.get("threshold"),
+        interval=data.get("interval"),
+        gamma_scaling=data.get("gamma_scaling"),
+        max_trade=data.get("max_trade"),
+    )
+    auto_hedger.start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/autohedge/stop", methods=["POST"])
+def api_autohedge_stop():
+    auto_hedger.stop()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/autohedge/params", methods=["POST"])
+def api_autohedge_params():
+    data = request.get_json() or {}
+    auto_hedger.update_params(
+        threshold=data.get("threshold"),
+        interval=data.get("interval"),
+        gamma_scaling=data.get("gamma_scaling"),
+        max_trade=data.get("max_trade"),
+    )
+    return jsonify({"ok": True})
+
+
+@app.route("/api/autohedge/status")
+def api_autohedge_status():
+    return jsonify(auto_hedger.get_status())
+
+
+# ---- Backtest API ----
+@app.route("/api/backtest", methods=["POST"])
+def api_backtest():
+    data = request.get_json() or {}
+    result = BacktestEngine.run_delta_hedge_backtest(data)
     return jsonify(result)
 
 
