@@ -27,7 +27,7 @@ A single-file Flask application (`svi_ui.py`) that connects to your Deribit acco
 
 **Models.**
 
-- **SVI calibration** — raw SVI total variance $w(k) = a + b\,(\rho(k-m) + \sqrt{(k-m)^2 + \sigma^2})$ fitted to OTM mark IVs (puts below the forward, calls above, moneyness filter $|k| < 0.25$) by L-BFGS-B from four starting points, keeping the best fit.
+- **SVI calibration** — raw SVI total variance $w(k) = a + b(\rho(k-m) + \sqrt{(k-m)^2 + \sigma^2})$ fitted to OTM mark IVs (puts below the forward, calls above, moneyness filter $|k| < 0.25$) by L-BFGS-B from four starting points, keeping the best fit.
 - **Black-76 with r = 0** — pricing and Greeks under BTC-settled inverse-contract conventions; premiums quoted in BTC.
 - **Greeks by finite differences** — delta as dV<sub>USD</sub>/dF (BTC-equivalent, matching Deribit), gamma as the change in delta for a 1% spot move, vega per vol point, theta per calendar day.
 - **Smile delta** — a second delta computed under sticky-delta dynamics: when spot is bumped, each option's IV is re-read from the calibrated SVI smile at its new moneyness rather than held fixed at its strike.
