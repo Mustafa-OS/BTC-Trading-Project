@@ -1,12 +1,35 @@
-# BTC Options Trading & Risk Platform
+# 📈 Bitcoin Options Trading & Risk Platform
 
-Live SVI implied-volatility surface fitting, portfolio Greeks with scenario analysis, a gamma-aware automated delta hedger, and a hedging backtester — for BTC options and futures on Deribit.
+**A live trading dashboard for Bitcoin options: it prices the market in real time, shows exactly where a portfolio is exposed, and runs a bot that hedges that risk automatically.**
 
-![Risk tab — per-position Greeks and scenario analysis across spot bumps](docs/img/risk-scenarios.png)
+**[▶ Try the browser version](https://mustafa-os.github.io/BTC-Trading-Project/)** (no keys needed) · Python · NumPy · SciPy · Flask · WebSockets · Deribit API
 
-*Risk tab: per-position Greeks and a scenario matrix of P&L, delta, gamma, vega and theta across spot bumps from −10% to +10% (running against a Deribit testnet account).*
+![Risk tab: per-position Greeks and scenario analysis across spot bumps](docs/img/risk-scenarios.png)
 
-## What it does
+*The Risk tab: how each position's value and risk would change if Bitcoin moved by up to ±10% (running on a Deribit test account).*
+
+## At a glance
+
+- 📉 **Fits the volatility smile live.** Calibrates an SVI model to Deribit's option prices as they stream in, then prices any option from it.
+- 🧮 **Full risk picture.** Portfolio Greeks (delta, gamma, vega, theta) per position and in total, plus "what if BTC moves 10%?" scenarios.
+- 🤖 **Automatic delta hedger.** A background bot that trades the BTC perpetual to keep the portfolio neutral, and **tightens its trigger when risk is changing fast** (high gamma).
+- 🔬 **Backtester.** Replays historical prices to test hedging rules, reporting P&L, Sharpe ratio, drawdown and trading costs.
+- 🧾 **Reconciliation.** Rebuilds account equity from every trade, settlement and funding payment, and checks it against Deribit's own figure.
+
+## In plain English
+
+An option's price depends on how much traders expect the price of Bitcoin to swing, its *implied volatility*. That expectation differs for every strike price, forming a curve called the **volatility smile**. This platform:
+
+1. **Reads** live prices for every Bitcoin option and future from the Deribit exchange.
+2. **Fits** a smooth smile through them (the SVI model), so any option can be priced consistently.
+3. **Measures** how the portfolio would gain or lose as Bitcoin's price, volatility or time changes.
+4. **Hedges** automatically: when the portfolio leans too far one way, it places an offsetting trade.
+
+![Auto Hedge tab: running hedger with parameters and activity log](docs/img/auto-hedge.png)
+
+*The hedger spots +0.13 BTC of exposure, sells $10,000 of the BTC perpetual to cancel it, and logs the fill.*
+
+## The eight tabs
 
 A single-file Flask application (`svi_ui.py`) that connects to your Deribit account and serves an eight-tab trading dashboard:
 
@@ -21,7 +44,8 @@ A single-file Flask application (`svi_ui.py`) that connects to your Deribit acco
 | **Auto Hedge** | Background delta hedger that monitors portfolio delta and rebalances via BTC-PERPETUAL, tightening its threshold automatically when gamma is large. |
 | **Backtest** | Replays historical Deribit candles and simulates delta-hedging a short (or long) option position, reporting P&L, annualised Sharpe, max drawdown and trading costs. |
 
-## How it works
+<details>
+<summary><b>How it works: architecture, models and maths</b></summary>
 
 **Architecture.** Python/Flask backend with a Plotly.js frontend. Three background threads stream and process data: a futures WebSocket (spot index + all inverse futures marks), an options WebSocket for the selected expiry (`ticker.<instrument>.agg2` channels), and a risk poller that pulls positions over REST. Orders are executed over an authenticated WebSocket for lower latency.
 
@@ -35,13 +59,11 @@ A single-file Flask application (`svi_ui.py`) that connects to your Deribit acco
 
 **Auto hedger with gamma scaling.** The hedger checks portfolio delta on a configurable interval and trades BTC-PERPETUAL to flatten it whenever |delta| exceeds a threshold. With gamma scaling on, the effective threshold is `base / (1 + 50·|gamma|)`, floored at 20% of base — so a high-gamma book is rebalanced with much tighter bands, since its delta moves quickly with spot. Trade sizes respect Deribit's $10 increments and a configurable per-trade cap, and every decision is written to an activity log.
 
-![Auto Hedge tab — running hedger with parameters and activity log](docs/img/auto-hedge.png)
-
-*Auto Hedge tab: the hedger detects +0.13 BTC of delta, sells $10,000 of BTC-PERPETUAL to flatten it, and logs the fill.*
-
 **Backtester.** Fetches historical OHLCV candles from Deribit's public API (paginated), simulates an option position at a chosen strike offset, IV and expiry, and delta-hedges with the perpetual at a configurable interval, delta threshold and transaction cost. Reports total P&L in BTC, annualised Sharpe, max drawdown and hedge count.
 
-## Getting started
+</details>
+
+## Run it
 
 ```bash
 pip install -r requirements.txt
@@ -63,18 +85,14 @@ python3 svi_ui.py
 
 > **Note:** the Hedge and Auto Hedge tabs place real orders on whichever network you sign in to. Use a testnet account unless you mean it.
 
-## Browser-only version
+### Browser-only version
 
 `index.html` is a standalone client-side implementation of the Vol Smile and Futures Curve tabs — SVI calibration included — using only Deribit's public API, so no keys are needed. Open it directly or visit [mustafa-os.github.io/BTC-Trading-Project](https://mustafa-os.github.io/BTC-Trading-Project/).
 
-## Tech stack
+## About
 
-Python, Flask, NumPy, SciPy (L-BFGS-B, cubic splines), websocket-client, Plotly.js · Deribit REST + WebSocket APIs
-
-## Project context
-
-Personal project, built March–April 2026 to learn options market-making mechanics — volatility surface fitting, Greeks under inverse-contract conventions, and the practical trade-offs of delta hedging.
+Personal project, built March–April 2026 to learn how options market-makers work: fitting volatility surfaces, Greeks under Bitcoin's inverse-contract conventions, and the real trade-offs of delta hedging.
 
 ---
 
-Built by Mustafa Suleman — MEng Design Engineering, Imperial College London · [LinkedIn](https://www.linkedin.com/in/mustafaosuleman/)
+<sub>Built by <b>Mustafa Suleman</b>, MEng Design Engineering, Imperial College London · <a href="https://github.com/Mustafa-OS">More projects</a> · <a href="https://www.linkedin.com/in/mustafaosuleman/">LinkedIn</a></sub>
